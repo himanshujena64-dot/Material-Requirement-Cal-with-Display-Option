@@ -1,5 +1,5 @@
 """
-SAP MRP ENGINE — Full L1 to L4 with Phantom Handling
+MATERIAL REQUIREMENT CALCULATION
 Streamlit Cloud deployment (GitHub-ready)
 
 Fixes applied:
