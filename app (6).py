@@ -7,6 +7,7 @@ Fixes applied:
   2. AttributeError: duplicate month columns no longer crash the app
   3. Receipt Quantity file: adds to stock before shortage calculation
   4. Component search bar with ancestry tree (Graphviz)
+  5. Shortage = positive, Excess = negative in output
 """
 
 import io
@@ -323,10 +324,10 @@ def build_dot_tree(component, paths, req_df, months, stock, prod_summary):
         df = result_dfs.get(key)
         if df is None or df.empty:
             continue
-        agg = df.groupby("Component")[["Gross_Requirement","Shortage"]].sum()
+        agg = df.groupby("Component")[["Gross_Requirement","Demand_Shortage_Excess"]].sum()
         for comp, row in agg.iterrows():
-            gross_map[comp]    = gross_map.get(comp, 0)    + row["Gross_Requirement"]
-            shortage_map[comp] = shortage_map.get(comp, 0) + row["Shortage"]
+            gross_map[comp]    = gross_map.get(comp, 0) + row["Gross_Requirement"]
+            shortage_map[comp] = shortage_map.get(comp, 0) + row["Demand_Shortage_Excess"]
 
     def trunc(s, n=20):
         return (str(s)[:n]+"…") if len(str(s))>n else str(s)
@@ -363,7 +364,7 @@ def build_dot_tree(component, paths, req_df, months, stock, prod_summary):
                 label = (f"{trunc(comp)}\\n{trunc(desc)}\\n"
                          f"Stock: {stk:,.0f} | Conf: {conf:,.0f}\\n"
                          f"Open PO: {oprod:,.0f}\\n"
-                         f"Gross: {gross:,.0f} | Short: {shortage:,.0f}")
+                         f"Gross: {gross:,.0f} | Short/Excess: {shortage:,.0f}")
                 node_attrs[nid] = (
                     f'label="{label}" shape=box style="filled,rounded"'
                     f' fillcolor="#1e8449" fontcolor=white fontsize=11 penwidth=2.5'
@@ -378,7 +379,7 @@ def build_dot_tree(component, paths, req_df, months, stock, prod_summary):
             else:
                 label = (f"{trunc(comp)}\\n{trunc(desc)}\\n"
                          f"Qty: {qty:g} | Stock: {stk:,.0f}\\n"
-                         f"Gross: {gross:,.0f} | Short: {shortage:,.0f}")
+                         f"Gross: {gross:,.0f} | Short/Excess: {shortage:,.0f}")
                 node_attrs[nid] = (
                     f'label="{label}" shape=box style="filled,rounded"'
                     f' fillcolor="#f9e79f" fontcolor="#333" fontsize=10'
@@ -449,34 +450,43 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
     c5.metric("Sp. procurement",    sp if sp not in ("","nan") else "—")
 
     if found_in:
-        st.markdown("#### Monthly demand & shortage")
+        st.markdown("#### Monthly demand & shortage/excess")
         all_rows = pd.concat(found_in.values(), ignore_index=True)
         mo = {m:i for i,m in enumerate(months)}
         monthly = (all_rows.groupby("Month", as_index=False)
                    .agg(Gross_Requirement=("Gross_Requirement","sum"),
                         Stock_Used=("Stock_Used","sum"),
-                        Shortage=("Shortage","sum"),
+                        Demand_Shortage_Excess=("Demand_Shortage_Excess","sum"),
                         Stock_Remaining=("Stock_Remaining","last")))
         monthly["_ord"] = monthly["Month"].map(mo)
         monthly = monthly.sort_values("_ord").drop(columns="_ord")
-        monthly["Cumulative Shortage"] = monthly["Shortage"].cumsum()
+        monthly["Cumulative"] = monthly["Demand_Shortage_Excess"].cumsum()
 
         def hl(row):
-            c = "background-color:#ffe0e0" if row["Shortage"]>0 else ""
-            return [c]*len(row)
+            # Red for shortage (>0), Green for excess (<0)
+            if row["Demand_Shortage_Excess"] > 0:
+                return ["background-color:#ffe0e0"] * len(row)  # shortage - red
+            elif row["Demand_Shortage_Excess"] < 0:
+                return ["background-color:#e0f7e0"] * len(row)  # excess - green
+            return [""] * len(row)
 
         st.dataframe(
             monthly.style.apply(hl, axis=1).format({
-                "Gross_Requirement":"{:,.2f}","Stock_Used":"{:,.2f}",
-                "Shortage":"{:,.2f}","Stock_Remaining":"{:,.2f}",
-                "Cumulative Shortage":"{:,.2f}"}),
+                "Gross_Requirement":"{:,.2f}",
+                "Stock_Used":"{:,.2f}",
+                "Demand_Shortage_Excess":"{:,.2f}",
+                "Stock_Remaining":"{:,.2f}",
+                "Cumulative":"{:,.2f}"
+            }),
             use_container_width=True, hide_index=True)
 
         s1,s2,s3,s4 = st.columns(4)
+        total_shortage = monthly[monthly["Demand_Shortage_Excess"] > 0]["Demand_Shortage_Excess"].sum()
+        total_excess = abs(monthly[monthly["Demand_Shortage_Excess"] < 0]["Demand_Shortage_Excess"].sum())
         s1.metric("Total gross req",     f"{monthly['Gross_Requirement'].sum():,.2f}")
         s2.metric("Total stock consumed",f"{monthly['Stock_Used'].sum():,.2f}")
-        s3.metric("Total shortage",      f"{monthly['Shortage'].sum():,.2f}")
-        s4.metric("Months with shortage",f"{(monthly['Shortage']>0).sum()} / {len(monthly)}")
+        s3.metric("Total shortage",      f"{total_shortage:,.2f}")
+        s4.metric("Total excess stock",  f"{total_excess:,.2f}")
     else:
         st.info("Component in BOM but not in MRP results (phantom or no demand).")
 
@@ -687,290 +697,4 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
                 conf_col   = next((c for c in coois.columns
                                    if "confirm" in c.lower() and "quantity" in c.lower()), None)
 
-                if all([status_col, mat_col, ord_col, del_col, conf_col]):
-                    coois = coois[~coois[status_col].astype(str)
-                                  .str.contains("TECO", case=False, na=False)].copy()
-                    coois[mat_col]  = coois[mat_col].astype(str).str.strip()
-                    coois[ord_col]  = pd.to_numeric(coois[ord_col],  errors="coerce").fillna(0)
-                    coois[del_col]  = pd.to_numeric(coois[del_col],  errors="coerce").fillna(0)
-                    coois[conf_col] = pd.to_numeric(coois[conf_col], errors="coerce").fillna(0)
-                    coois["Open_Qty"] = (coois[ord_col]-coois[del_col]).clip(lower=0)
-                    prod_summary = (
-                        coois.groupby(mat_col, as_index=False)
-                             .agg(Confirmed_Qty=(conf_col,"sum"),
-                                  Open_Production_Qty=("Open_Qty","sum"))
-                             .rename(columns={mat_col:"Component"})
-                    )
-                    prod_summary["Component"] = prod_summary["Component"].astype(str).str.strip()
-                    log(f"Production order rows (non-TECO): {len(coois):,}")
-                else:
-                    log("Production order columns not detected — defaulting to 0.")
-        except Exception as e:
-            log(f"Production order error ({e}) — defaulting to 0.")
-
-    # ── SECTION 4: MRP HELPERS ────────────────────────────────
-    def get_sfrac(rows, comp_col, gross_col):
-        agg = rows.groupby([comp_col,"Month","Month_Order"], as_index=False)[gross_col].sum()
-        sfrac = {}
-        for comp, grp in agg.groupby(comp_col):
-            avail = float(stock.get(comp, 0))
-            for _, row in grp.sort_values("Month_Order").iterrows():
-                g = float(row[gross_col])
-                sfrac[(comp, row["Month"])] = max(0.0, g-avail)/g if g>0 else 0.0
-                avail = max(0.0, avail-g)
-        return sfrac
-
-    def make_report(gross_agg_df, comp_col):
-        BASE = ["Component","Description","Month","Gross_Requirement",
-                "Stock_Used","Shortage","Stock_Remaining"]
-        if gross_agg_df.empty:
-            return pd.DataFrame(columns=BASE)
-        results = []
-        for comp, grp in gross_agg_df.groupby(comp_col):
-            avail = float(stock.get(comp, 0))
-            desc  = grp["Desc"].iloc[0]
-            for _, row in grp.sort_values("Month_Order").iterrows():
-                gr       = float(row["Gross"])
-                consumed = min(avail, gr)
-                shortage = max(0.0, gr-avail)
-                avail    = max(0.0, avail-gr)
-                results.append({"Component":comp,"Description":desc,"Month":row["Month"],
-                                 "Gross_Requirement":gr,"Stock_Used":consumed,
-                                 "Shortage":shortage,"Stock_Remaining":avail})
-        return pd.DataFrame(results, columns=BASE)
-
-    def apply_sfrac(df, gross_col, ph_col, sfrac_dict, comp_col):
-        return df.apply(
-            lambda r: r[gross_col] if is_phantom(r[ph_col])
-                      else r[gross_col]*sfrac_dict.get((r[comp_col],r["Month"]),1.0),
-            axis=1)
-
-    # ── SECTION 5: MRP EXPLOSION L1 → L4 ─────────────────────
-    with status:
-        st.write("► Running MRP explosion ...")
-
-    # LEVEL 1
-    bom_l1 = (bom[bom["Level"]==1]
-              [["BOM Header","Alt","Component","Component descriptio",
-                "Required Qty","Special procurement"]].copy()
-              .rename(columns={"Component":"L1_Comp","Component descriptio":"L1_Desc",
-                                "Required Qty":"L1_Qty","Special procurement":"L1_Ph"}))
-    l1 = req_long.merge(bom_l1, on=["BOM Header","Alt"], how="inner")
-    l1["L1_Gross"]    = l1["FG_Demand"] * l1["L1_Qty"]
-    l1["Month_Order"] = l1["Month"].map(MONTH_ORDER)
-    l1_norm  = l1[~l1["L1_Ph"].apply(is_phantom)].copy()
-    l1_sfrac = get_sfrac(l1_norm, "L1_Comp", "L1_Gross")
-    l1["L1_Eff"] = apply_sfrac(l1, "L1_Gross", "L1_Ph", l1_sfrac, "L1_Comp")
-    l1_agg = (l1_norm.groupby(["L1_Comp","L1_Desc","Month","Month_Order"], as_index=False)
-              ["L1_Gross"].sum()
-              .rename(columns={"L1_Comp":"Component","L1_Desc":"Desc","L1_Gross":"Gross"}))
-    result_l1 = make_report(l1_agg, "Component")
-
-    # LEVEL 2
-    bom_l2 = (bom[bom["Level"]==2]
-              [["BOM Header","Alt","Parent","Component","Component descriptio",
-                "Required Qty","Special procurement"]].copy()
-              .rename(columns={"Parent":"L1_Comp","Component":"L2_Comp",
-                                "Component descriptio":"L2_Desc","Required Qty":"L2_Qty",
-                                "Special procurement":"L2_Ph"}))
-    l2 = l1.merge(bom_l2, on=["BOM Header","Alt","L1_Comp"], how="inner")
-    l2["L2_Gross"] = l2["L1_Eff"] * l2["L2_Qty"]
-    l2_norm  = l2[~l2["L2_Ph"].apply(is_phantom)].copy()
-    l2_sfrac = get_sfrac(l2_norm, "L2_Comp", "L2_Gross")
-    l2["L2_Eff"] = apply_sfrac(l2, "L2_Gross", "L2_Ph", l2_sfrac, "L2_Comp")
-    l2_agg = (l2_norm.groupby(["L2_Comp","L2_Desc","Month","Month_Order"], as_index=False)
-              ["L2_Gross"].sum()
-              .rename(columns={"L2_Comp":"Component","L2_Desc":"Desc","L2_Gross":"Gross"}))
-    result_l2 = make_report(l2_agg, "Component")
-
-    # LEVEL 3
-    bom_l3 = (bom[bom["Level"]==3]
-              [["BOM Header","Alt","Parent","Component","Component descriptio",
-                "Required Qty","Special procurement"]].copy()
-              .rename(columns={"Parent":"L2_Comp","Component":"L3_Comp",
-                                "Component descriptio":"L3_Desc","Required Qty":"L3_Qty",
-                                "Special procurement":"L3_Ph"}))
-    l3 = l2.merge(bom_l3, on=["BOM Header","Alt","L2_Comp"], how="inner")
-    l3["L3_Gross"] = l3.apply(
-        lambda r: r["L2_Eff"] if is_phantom(r["L3_Ph"]) else r["L2_Eff"]*r["L3_Qty"], axis=1)
-    l3_norm  = l3[~l3["L3_Ph"].apply(is_phantom)].copy()
-    l3_sfrac = get_sfrac(l3_norm, "L3_Comp", "L3_Gross")
-    l3["L3_Eff"] = apply_sfrac(l3, "L3_Gross", "L3_Ph", l3_sfrac, "L3_Comp")
-    l3_agg = (l3_norm.groupby(["L3_Comp","L3_Desc","Month","Month_Order"], as_index=False)
-              ["L3_Gross"].sum()
-              .rename(columns={"L3_Comp":"Component","L3_Desc":"Desc","L3_Gross":"Gross"}))
-    result_l3 = make_report(l3_agg, "Component")
-
-    # LEVEL 4
-    bom_l4 = (bom[bom["Level"]==4]
-              [["BOM Header","Alt","Parent","Component","Component descriptio",
-                "Required Qty","Special procurement"]].copy()
-              .rename(columns={"Parent":"L3_Comp","Component":"L4_Comp",
-                                "Component descriptio":"L4_Desc","Required Qty":"L4_Qty",
-                                "Special procurement":"L4_Ph"}))
-    l4 = l3.merge(bom_l4, on=["BOM Header","Alt","L3_Comp"], how="inner")
-    l4["L4_Gross"] = l4["L3_Eff"] * l4["L4_Qty"]
-    l4_agg = (l4.groupby(["L4_Comp","L4_Desc","Month","Month_Order"], as_index=False)
-              ["L4_Gross"].sum()
-              .rename(columns={"L4_Comp":"Component","L4_Desc":"Desc","L4_Gross":"Gross"}))
-    result_l4 = make_report(l4_agg, "Component")
-
-    with status:
-        st.write("► Building output ...")
-    status.update(label="MRP complete ✅", state="complete", expanded=False)
-
-    # ── SECTION 6: SUMMARY & VERIFICATION ────────────────────
-    st.divider()
-    st.subheader("📊 Summary")
-
-    # Show receipt info if used
-    if not receipt_qty.empty:
-        st.info(f"ℹ️ Receipt quantities applied: {receipt_added} components had stock increased "
-                f"before shortage calculation.")
-
-    c1,c2,c3,c4 = st.columns(4)
-    for col_ui, lbl, df in zip([c1,c2,c3,c4],["L1","L2","L3","L4"],
-                                [result_l1,result_l2,result_l3,result_l4]):
-        short = df[df["Shortage"]>0]["Component"].nunique() if not df.empty else 0
-        with col_ui:
-            st.metric(f"L{lbl[-1]} components", df["Component"].nunique() if not df.empty else 0)
-            st.metric("With shortage", short)
-
-    st.divider()
-    st.subheader("🔍 Verification")
-    tab1,tab2,tab3,tab4 = st.tabs(["L1","L2","L3 (phantom)","L4"])
-
-    def show_verify(tab, result_df, target, level_label):
-        with tab:
-            st.markdown(f"**{level_label} — `{target}`**")
-            if result_df is None or result_df.empty:
-                st.warning("No rows at this level."); return
-            t = result_df[result_df["Component"]==target]
-            if t.empty:
-                st.info("Not found — phantom or no demand."); return
-            st.caption(f"Description: {t['Description'].iloc[0]} | "
-                       f"Opening Stock (post-receipt): {stock.get(target,0):,.3f}")
-            st.dataframe(t[["Month","Gross_Requirement","Stock_Used","Shortage","Stock_Remaining"]]
-                          .reset_index(drop=True), use_container_width=True)
-
-    show_verify(tab1, result_l1, VERIFY_L1, "LEVEL 1")
-    show_verify(tab2, result_l2, VERIFY_L2, "LEVEL 2")
-    with tab3:
-        ph_found = (not result_l3.empty) and (VERIFY_L3 in result_l3["Component"].values)
-        if ph_found:
-            st.error(f"ERROR: {VERIFY_L3} found in results — phantom logic broken!")
-        else:
-            st.success(f"✅ {VERIFY_L3} correctly SKIPPED.")
-        st.caption(f"Phantom rows passed through: {len(l3[l3['L3_Ph'].apply(is_phantom)]):,}")
-    show_verify(tab4, result_l4, VERIFY_L4, "LEVEL 4")
-
-    if months:
-        l4_jan = l4[(l4["L4_Comp"]==VERIFY_L4) & (l4["Month"]==months[0])]
-        if not l4_jan.empty:
-            with tab4:
-                bd = (l4_jan.groupby("BOM Header")["L4_Gross"].sum()
-                      .sort_values(ascending=False).reset_index())
-                bd.columns = ["BOM Header", f"Gross ({months[0]})"]
-                total = bd[f"Gross ({months[0]})"].sum()
-                stk2  = stock.get(VERIFY_L4, 0)
-                st.caption(f"Total: {total:,.3f} | Stock: {stk2:,.3f} | "
-                           f"Shortage: {max(0,total-stk2):,.3f}")
-                st.dataframe(bd, use_container_width=True)
-
-    # ── SECTION 7: EXPORT ────────────────────────────────────
-    final_output = pd.concat([result_l1,result_l2,result_l3,result_l4], ignore_index=True)
-    all_comps = final_output[["Component","Description"]].drop_duplicates(subset="Component").copy()
-
-    pivot = (final_output
-             .pivot_table(index=["Component","Description"], columns="Month",
-                          values="Shortage", aggfunc="sum", fill_value=0)
-             .reset_index())
-    pivot = all_comps.merge(pivot, on=["Component","Description"], how="left").fillna(0)
-
-    month_cols = [m for m in months if m in pivot.columns]
-    if month_cols:
-        pivot[month_cols] = pivot[month_cols].cumsum(axis=1)
-
-    bom_master = bom[["Component","Procurement type","Special procurement"]].drop_duplicates(subset="Component")
-    stock_df   = stock.reset_index().rename(columns={"Stock_Qty":"Stock"})
-
-    pivot = (pivot
-             .merge(bom_master,   on="Component", how="left")
-             .merge(stock_df,     on="Component", how="left")
-             .merge(prod_summary, on="Component", how="left"))
-
-    pivot["Procurement type"]    = pivot["Procurement type"].fillna("")
-    pivot["Special procurement"] = pivot["Special procurement"].fillna("")
-    pivot["Stock"]               = pivot["Stock"].fillna(0)
-    pivot["Confirmed_Qty"]       = pivot["Confirmed_Qty"].fillna(0)
-    pivot["Open_Production_Qty"] = pivot["Open_Production_Qty"].fillna(0)
-
-    # Add receipt qty column if used
-    if not receipt_qty.empty:
-        rq_df = receipt_qty.reset_index()
-        rq_df.columns = ["Component","Receipt_Qty"]
-        pivot = pivot.merge(rq_df, on="Component", how="left")
-        pivot["Receipt_Qty"] = pivot["Receipt_Qty"].fillna(0)
-        extra_cols = ["Receipt_Qty"]
-    else:
-        extra_cols = []
-
-    pivot = pivot.rename(columns={"Description":"Component descri"})
-    final_cols = (["Component","Component descri","Procurement type","Special procurement",
-                   "Confirmed_Qty","Open_Production_Qty","Stock"]
-                  + extra_cols + month_cols)
-    for c in final_cols:
-        if c not in pivot.columns:
-            pivot[c] = 0 if c in month_cols+["Confirmed_Qty","Open_Production_Qty","Stock","Receipt_Qty"] else ""
-    pivot = pivot[final_cols].sort_values("Component").reset_index(drop=True)
-
-    st.divider()
-    st.subheader("📋 Output preview")
-    st.dataframe(pivot.head(200), use_container_width=True)
-    st.caption(f"{len(pivot):,} rows · {len(month_cols)} date/month columns · cumulative shortage")
-
-    buf = io.BytesIO()
-    pivot.to_excel(buf, index=False, engine="openpyxl")
-    buf.seek(0)
-    st.download_button("⬇️ Download mrp_final.xlsx", data=buf, file_name="mrp_final.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       use_container_width=True, type="primary")
-
-    with st.expander("Run log"):
-        for line in logs:
-            st.text(line)
-
-    return dict(bom=bom, req=req, months=months, stock=stock,
-                prod_summary=prod_summary,
-                result_l1=result_l1, result_l2=result_l2,
-                result_l3=result_l3, result_l4=result_l4)
-
-
-# ═══════════════════════════════════════════════════════════════
-# SESSION STATE + ENTRY POINT
-# ═══════════════════════════════════════════════════════════════
-if "mrp_results" not in st.session_state:
-    st.session_state["mrp_results"] = None
-
-if not run_btn and bom_file is None:
-    st.info("Upload your files in the sidebar, then click **▶ Run MRP**.")
-elif run_btn:
-    if bom_file is None or req_file is None:
-        st.warning("Please upload at least the BOM file and the Req & Stock file.")
-    else:
-        try:
-            results = run_mrp(bom_file, req_file, prod_file, receipt_file)
-            if results is not None:
-                st.session_state["mrp_results"] = results
-        except Exception as e:
-            st.exception(e)
-
-if st.session_state["mrp_results"] is not None:
-    r = st.session_state["mrp_results"]
-    try:
-        show_search_section(
-            bom=r["bom"], req_df=r["req"], months=r["months"],
-            stock=r["stock"], prod_summary=r["prod_summary"]
-        )
-    except Exception as e:
-        st.error(f"Search error: {e}")
+                if all([status_col, mat_col, ord_col
