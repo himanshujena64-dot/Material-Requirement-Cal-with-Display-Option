@@ -1,5 +1,5 @@
 """
-MATERIAL REQUIREMENT CALCULATION
+SAP MRP ENGINE — Full L1 to L4 with Phantom Handling
 Streamlit Cloud deployment (GitHub-ready)
 
 Fixes applied:
@@ -17,8 +17,8 @@ import streamlit as st
 # ═══════════════════════════════════════════════════════════════
 # PAGE CONFIG
 # ═══════════════════════════════════════════════════════════════
-st.set_page_config(page_title="MATERIAL REQUIREMENT CALCULATION", page_icon="⚙️", layout="wide")
-st.title("⚙️ FOR ALL LEVEL — L1 to L4")
+st.set_page_config(page_title="SAP MRP Engine", page_icon="⚙️", layout="wide")
+st.title("⚙️ SAP MRP Engine — L1 to L4")
 st.caption("Phantom handling · Alt-aware · NET propagation · Dynamic date/month columns")
 
 # ═══════════════════════════════════════════════════════════════
